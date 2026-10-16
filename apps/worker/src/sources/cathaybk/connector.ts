@@ -9,6 +9,7 @@ import puppeteer, {
   type Browser,
   type CookieParam,
   type HTTPRequest,
+  type HTTPResponse,
   type Page,
   TimeoutError,
 } from "@cloudflare/puppeteer";
@@ -50,6 +51,8 @@ const LOAN_OVERVIEW_URL =
   "https://www.cathaybk.com.tw/OnlineBanking/LoanInq/L0101_LoanInq";
 
 const API_DEPOSIT_TX = "B_ACCT_Q_TransferDetail";
+const API_MENU_STATUS = "G_SITE_Q_MenuIdStatus";
+const DEPOSIT_DETAIL_MENU_ID = "React_B0103_TxnDtlInq";
 const API_FOREIGN_DEPOSIT_OVERVIEW = "R_ACCT_Q_OverView";
 const API_CARD_STATUS = "C_COM_Q_CardStatus";
 const OTP_SESSION_TTL_MS = 2 * 60 * 1000;
@@ -1294,11 +1297,23 @@ async function chooseCathayComboboxOption(
   await dismissCathayDetailDialog(page);
   await page.focus(`[data-cathay-combobox="${kind}"]`);
   await page.keyboard.press("ArrowDown");
-  await page.waitForFunction(
-    () =>
-      document.querySelectorAll("[role='option'], [id*='-option-']").length > 0,
-    { timeout: 5000 },
-  );
+  await page
+    .waitForFunction(
+      () =>
+        document.querySelectorAll("[role='option'], [id*='-option-']").length >
+        0,
+      { timeout: 5000 },
+    )
+    .catch(async (error: unknown) => {
+      console.error(
+        JSON.stringify({
+          event: "cathaybk_combobox_options_timeout",
+          kind,
+          ...(await readCathayDetailFormState(page)),
+        }),
+      );
+      throw error;
+    });
   const selected = await page.evaluate(
     (target: CathayCombobox, match: string) => {
       const option = Array.from(
@@ -1376,17 +1391,19 @@ async function dismissCathayDetailDialog(page: Page) {
     }
     // 「下次再提醒」只關閉公告；「不要再顯示」會改帳戶偏好，不點。
     const allowed = [
+      "下次再提醒",
       "我知道了",
       "知道了",
       "關閉",
       "我已了解",
       "了解",
-      "下次再提醒",
       "×",
       "close",
       "Close",
     ];
-    const index = labels.findIndex((label) => allowed.includes(label));
+    // 依 allowed 順序挑按鈕，優先「下次再提醒」。
+    const preferred = allowed.find((label) => labels.includes(label));
+    const index = preferred ? labels.indexOf(preferred) : -1;
     if (index < 0) return { ...summary, clicked: null, blocked: false };
     buttons[index]!.click();
     return { ...summary, clicked: labels[index], blocked: false };
@@ -1409,6 +1426,125 @@ async function dismissCathayDetailDialog(page: Page) {
         throw new Error("國泰世華明細頁公告未能關閉，未更新資料。");
       });
   }
+}
+
+type CathayDetailMenuState = { isMaintain?: boolean };
+
+/**
+ * 點開存款帳戶後等待明細頁查詢表單（帳號與期間 combobox）。
+ * 等待期間若出現公告對話框，先以 dismissCathayDetailDialog 關閉（優先「下次再提醒」）。
+ * 網銀回報此功能維護中時直接中止；逾時記錄去識別的頁面狀態，不記頁面文字。
+ */
+async function waitForCathayDetailForm(
+  page: Page,
+  menuState: CathayDetailMenuState,
+  timeout = 25_000,
+) {
+  const startedAt = Date.now();
+  let dismissAttempts = 0;
+  let lastState: Awaited<ReturnType<typeof readCathayDetailFormState>> | null =
+    null;
+  let loggedDialog = false;
+  while (Date.now() - startedAt < timeout) {
+    assertCathayNotLoggedOut(page);
+    if (menuState.isMaintain) {
+      console.warn(
+        JSON.stringify({
+          event: "cathaybk_detail_form",
+          outcome: "maintenance",
+          elapsedMs: Date.now() - startedAt,
+        }),
+      );
+      throw new Error("國泰世華存款明細查詢維護中，未更新資料。");
+    }
+    lastState = await readCathayDetailFormState(page);
+    if (lastState.dialogCount > 0) {
+      if (!loggedDialog) {
+        loggedDialog = true;
+        console.warn(
+          JSON.stringify({
+            event: "cathaybk_detail_form",
+            outcome: "dialog_seen",
+            elapsedMs: Date.now() - startedAt,
+            ...lastState,
+          }),
+        );
+      }
+      if (dismissAttempts < 3) {
+        dismissAttempts += 1;
+        await dismissCathayDetailDialog(page);
+        continue;
+      }
+    } else if (lastState.comboboxCount > 0) {
+      console.log(
+        JSON.stringify({
+          event: "cathaybk_detail_form",
+          outcome: "ready",
+          elapsedMs: Date.now() - startedAt,
+          dismissAttempts,
+          comboboxCount: lastState.comboboxCount,
+          menuStatusSeen: menuState.isMaintain !== undefined,
+        }),
+      );
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  console.error(
+    JSON.stringify({
+      event: "cathaybk_detail_form",
+      outcome: "timeout",
+      elapsedMs: Date.now() - startedAt,
+      dismissAttempts,
+      menuStatusSeen: menuState.isMaintain !== undefined,
+      currentUrl: safeCathayDiagnosticUrl(page.url()),
+      ...lastState,
+    }),
+  );
+  throw new Error("國泰世華存款明細頁查詢表單未出現，未更新資料。");
+}
+
+async function readCathayDetailFormState(page: Page) {
+  return await page
+    .evaluate(() => {
+      const visible = (element: HTMLElement) => element.offsetParent !== null;
+      const dialogs = Array.from(
+        document.querySelectorAll<HTMLElement>(
+          "[role='dialog'], [aria-modal='true'], .modal.show, .modal.in",
+        ),
+      ).filter(visible);
+      return {
+        readyState: document.readyState,
+        comboboxCount: document.querySelectorAll("input[role='combobox']")
+          .length,
+        dialogCount: dialogs.length,
+        dialogButtonCount: dialogs.reduce(
+          (sum, dialog) =>
+            sum +
+            dialog.querySelectorAll("button, a[role='button'], [role='button']")
+              .length,
+          0,
+        ),
+        hasForm: Boolean(document.querySelector("form")),
+        hasSpinner: Boolean(
+          document.querySelector(
+            ".chakra-spinner, [class*='loading'], [class*='Loading']",
+          ),
+        ),
+        buttonCount: document.querySelectorAll("button").length,
+        bodyTextLength: document.body?.innerText.length ?? 0,
+      };
+    })
+    .catch(() => ({
+      readyState: "unavailable",
+      comboboxCount: 0,
+      dialogCount: 0,
+      dialogButtonCount: 0,
+      hasForm: false,
+      hasSpinner: false,
+      buttonCount: 0,
+      bodyTextLength: 0,
+    }));
 }
 
 function assertCathayNotLoggedOut(page: Pick<Page, "url">) {
@@ -1565,74 +1701,91 @@ async function scrapeDeposits(
     });
   }
 
-  for (const [index, acct] of accounts.entries()) {
-    const sourceId = `bank:cathaybk:${acct.acctNo}`;
-    if (index === 0) {
-      // Consume the page's initial 30-day query before changing selectors.
-      const initial = await readCathayDepositQuery(
+  const menuState: CathayDetailMenuState = {};
+  const onMenuStatus = (response: HTTPResponse) => {
+    if (!response.url().includes(API_MENU_STATUS)) return;
+    if (!response.request().postData()?.includes(DEPOSIT_DETAIL_MENU_ID))
+      return;
+    void response
+      .json()
+      .then((body: unknown) => {
+        const content = (body as { content?: { isMaintain?: unknown } })
+          ?.content;
+        menuState.isMaintain = content?.isMaintain === true;
+      })
+      .catch(() => undefined);
+  };
+  page.on("response", onMenuStatus);
+  try {
+    for (const [index, acct] of accounts.entries()) {
+      const sourceId = `bank:cathaybk:${acct.acctNo}`;
+      if (index === 0) {
+        // Consume the page's initial 30-day query before changing selectors.
+        const initial = await readCathayDepositQuery(
+          page,
+          acct.acctNo,
+          30,
+          async () => {
+            const clicked = await page.evaluate((accountNumber: string) => {
+              const button = Array.from(
+                document.querySelectorAll("button"),
+              ).find((button) => button.textContent?.trim() === accountNumber);
+              button?.click();
+              return Boolean(button);
+            }, acct.acctNo);
+            if (!clicked) {
+              throw new Error("國泰世華存款帳戶無法開啟，未更新資料。");
+            }
+            await waitForCathayDetailForm(page, menuState);
+          },
+        );
+        parseCathayDepositTransactions(initial, acct.acctNo);
+      }
+      // Track only transfer queries: analytics may keep the page's network busy.
+      await settleCathayDepositSelectors(page, async () => {
+        assertCathayNotLoggedOut(page);
+        if (index > 0) {
+          // Stay on the detail page: reopening the overview can end the session.
+          await chooseCathayComboboxOption(page, "account", acct.acctNo);
+        }
+        await chooseCathayComboboxOption(
+          page,
+          "period",
+          periodLabel(lookbackDays),
+        );
+      });
+      assertCathayNotLoggedOut(page);
+      const txData = await readCathayDepositQuery(
         page,
         acct.acctNo,
-        30,
+        lookbackDays,
         async () => {
-          const clicked = await page.evaluate((accountNumber: string) => {
+          const clicked = await page.evaluate(() => {
             const button = Array.from(document.querySelectorAll("button")).find(
-              (button) => button.textContent?.trim() === accountNumber,
+              (button) => button.textContent?.trim() === "查詢",
             );
             button?.click();
             return Boolean(button);
-          }, acct.acctNo);
-          if (!clicked) {
-            throw new Error("國泰世華存款帳戶無法開啟，未更新資料。");
-          }
-          await page.waitForSelector("input[role='combobox']", {
-            timeout: 15000,
           });
+          if (!clicked) {
+            throw new Error("國泰世華存款交易查詢按鈕不存在，未更新資料。");
+          }
         },
       );
-      parseCathayDepositTransactions(initial, acct.acctNo);
-    }
-    // Track only transfer queries: analytics may keep the page's network busy.
-    await settleCathayDepositSelectors(page, async () => {
-      assertCathayNotLoggedOut(page);
-      if (index > 0) {
-        // Stay on the detail page: reopening the overview can end the session.
-        await chooseCathayComboboxOption(page, "account", acct.acctNo);
-      }
-      await chooseCathayComboboxOption(
-        page,
-        "period",
-        periodLabel(lookbackDays),
+      const details = parseCathayDepositTransactions(txData, acct.acctNo);
+      console.log(
+        `[cathaybk] account ${maskAccountNumber(acct.acctNo)}: ${details.length} tx (period=${periodLabel(lookbackDays)})`,
       );
-    });
-    assertCathayNotLoggedOut(page);
-    const txData = await readCathayDepositQuery(
-      page,
-      acct.acctNo,
-      lookbackDays,
-      async () => {
-        const clicked = await page.evaluate(() => {
-          const button = Array.from(document.querySelectorAll("button")).find(
-            (button) => button.textContent?.trim() === "查詢",
-          );
-          button?.click();
-          return Boolean(button);
-        });
-        if (!clicked) {
-          throw new Error("國泰世華存款交易查詢按鈕不存在，未更新資料。");
-        }
-      },
-    );
-    const details = parseCathayDepositTransactions(txData, acct.acctNo);
-    console.log(
-      `[cathaybk] account ${maskAccountNumber(acct.acctNo)}: ${details.length} tx (period=${periodLabel(lookbackDays)})`,
-    );
 
-    appendCathayDepositTransactions(
-      bankTransactions,
-      details,
-      sourceId,
-      acct.currency,
-    );
+      appendCathayDepositTransactions(
+        bankTransactions,
+        details,
+        sourceId,
+        acct.currency,
+      );
+    }
+  } finally {
+    page.off("response", onMenuStatus);
   }
 
   return {
