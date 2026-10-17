@@ -1866,57 +1866,237 @@ describe("同步資料完整性（隔離 D1）", () => {
       is_paid: 0,
     });
   });
-  it("非國泰帳單維持 NULL 更新語義，但已付款 true 不降級", async () => {
-    const first: SyncWriteRecord = {
-      entityType: "credit_card_bill",
-      recordKey: "sinopac:bill",
-      payload: {
-        ...account.payload,
-        id: "sinopac:bill",
-        account_id: account.recordKey,
-        source_id: "bill",
+  // 歷史來源缺欄不能讓已保存的帳單金額、日期與付款狀態消失。
+  // 使用正規化資料直接驗證 mapper → staging → D1，不依賴永豐 parser。
+  it.each([
+    { isPaid: false, missing: undefined },
+    { isPaid: true, missing: undefined },
+    { isPaid: false, missing: null },
+    { isPaid: true, missing: null },
+  ])(
+    "永豐當期轉歷史：付款 $isPaid、缺值 $missing 保留六欄且同一期不重複",
+    async ({ isPaid, missing }) => {
+      const accountId = "credit:sinopac:main";
+      const current = creditCardBillRecord(
+        "sinopac",
+        {
+          sourceId: "current:2026-09:TWD",
+          accountId,
+          billingPeriod: "2026-09",
+          currency: "TWD",
+          statementAmount: 1000,
+          minimumPayment: 75,
+          paidAmount: isPaid ? 1000 : 600,
+          isPaid,
+          paymentDueDate: "2026-10-05",
+          statementClosingDate: "2026-09-20",
+          raw: { feed: "current" },
+        },
+        now,
+      );
+      await persistStagedSyncWrite(db, {
+        records: [
+          bankAccountRecord(
+            "sinopac",
+            {
+              sourceId: accountId,
+              institutionName: "永豐銀行",
+              accountType: "credit",
+              currency: "TWD",
+            },
+            now,
+          ),
+          current,
+        ],
+      });
+      const history = creditCardBillRecord(
+        "sinopac",
+        {
+          sourceId: "history:2026-09:TWD",
+          accountId,
+          billingPeriod: "2026-09",
+          currency: "TWD",
+          raw: { feed: "history" },
+        },
+        "2026-09-02T00:00:00Z",
+      );
+      // 同時涵蓋 staging payload 未提供欄位與明確 NULL。
+      for (const column of [
+        "statement_amount",
+        "minimum_payment",
+        "paid_amount",
+        "is_paid",
+        "payment_due_date",
+        "statement_closing_date",
+      ]) {
+        if (missing === undefined) delete history.payload[column];
+        else history.payload[column] = missing;
+      }
+      await persistStagedSyncWrite(db, { records: [history] });
+      await persistStagedSyncWrite(db, { records: [history] });
+      expect(
+        await db
+          .prepare("SELECT COUNT(*) AS n FROM credit_card_bills")
+          .first("n"),
+      ).toBe(1);
+      expect(
+        await db
+          .prepare(
+            "SELECT id, source_id, billing_period, statement_amount, minimum_payment, paid_amount, is_paid, payment_due_date, statement_closing_date, raw_payload, created_at, updated_at FROM credit_card_bills",
+          )
+          .first(),
+      ).toEqual({
+        id: current.recordKey,
+        source_id: history.payload.source_id,
         billing_period: "2026-09",
         statement_amount: 1000,
         minimum_payment: 75,
-        paid_amount: 600,
-        is_paid: 1,
+        paid_amount: isPaid ? 1000 : 600,
+        is_paid: isPaid ? 1 : 0,
         payment_due_date: "2026-10-05",
         statement_closing_date: "2026-09-20",
-      },
+        raw_payload: history.payload.raw_payload,
+        created_at: now,
+        updated_at: "2026-09-02T00:00:00Z",
+      });
+    },
+  );
+  it("永豐明確 0／false 更新已繳帳單，非空日期仍更新，之後缺欄保留零值與未繳", async () => {
+    const accountId = "credit:sinopac:zero-fields";
+    const bill = {
+      sourceId: "current:2026-09:TWD",
+      accountId,
+      billingPeriod: "2026-09",
+      currency: "TWD",
+      statementAmount: 1000,
+      minimumPayment: 75,
+      paidAmount: 1000,
+      isPaid: true,
+      paymentDueDate: "2026-10-05",
+      statementClosingDate: "2026-09-20",
     };
-    await persistStagedSyncWrite(db, { records: [account, first] });
     await persistStagedSyncWrite(db, {
       records: [
-        {
-          ...first,
-          payload: {
-            ...first.payload,
-            statement_amount: null,
-            minimum_payment: null,
-            paid_amount: null,
-            is_paid: 0,
-            payment_due_date: null,
-            statement_closing_date: null,
-            updated_at: "2026-09-02T00:00:00Z",
+        bankAccountRecord(
+          "sinopac",
+          {
+            sourceId: accountId,
+            institutionName: "永豐銀行",
+            accountType: "credit",
+            currency: "TWD",
           },
-        },
+          now,
+        ),
+        creditCardBillRecord("sinopac", bill, now),
       ],
     });
-    expect(
-      await db
+    await persistStagedSyncWrite(db, {
+      records: [
+        creditCardBillRecord(
+          "sinopac",
+          {
+            ...bill,
+            statementAmount: 0,
+            minimumPayment: 0,
+            paidAmount: 0,
+            isPaid: false,
+            paymentDueDate: "2026-10-06",
+            statementClosingDate: "2026-09-21",
+          },
+          "2026-09-02T00:00:00Z",
+        ),
+      ],
+    });
+    const expected = {
+      statement_amount: 0,
+      minimum_payment: 0,
+      paid_amount: 0,
+      is_paid: 0,
+      payment_due_date: "2026-10-06",
+      statement_closing_date: "2026-09-21",
+    };
+    const select = () =>
+      db
         .prepare(
           "SELECT statement_amount, minimum_payment, paid_amount, is_paid, payment_due_date, statement_closing_date FROM credit_card_bills",
         )
-        .first(),
-    ).toEqual({
-      statement_amount: null,
-      minimum_payment: null,
-      paid_amount: 600,
-      is_paid: 1,
-      payment_due_date: null,
-      statement_closing_date: null,
+        .first();
+    expect(await select()).toEqual(expected);
+    await persistStagedSyncWrite(db, {
+      records: [
+        creditCardBillRecord(
+          "sinopac",
+          {
+            sourceId: "history:2026-09:TWD",
+            accountId,
+            billingPeriod: bill.billingPeriod,
+            currency: "TWD",
+          },
+          "2026-09-03T00:00:00Z",
+        ),
+      ],
     });
+    expect(await select()).toEqual(expected);
   });
+  it.each(["esun", "taishin", "ctbc"] as const)(
+    "%s 帳單維持 NULL 更新語義，但已付款 true 不降級",
+    async (connectorId) => {
+      const otherAccount = bankAccountRecord(
+        connectorId,
+        { sourceId: "card", accountType: "credit", currency: "TWD" },
+        now,
+      );
+      const first: SyncWriteRecord = {
+        entityType: "credit_card_bill",
+        recordKey: `${connectorId}:bill`,
+        payload: {
+          ...otherAccount.payload,
+          id: `${connectorId}:bill`,
+          account_id: otherAccount.recordKey,
+          source_id: "bill",
+          billing_period: "2026-09",
+          statement_amount: 1000,
+          minimum_payment: 75,
+          paid_amount: 600,
+          is_paid: 1,
+          payment_due_date: "2026-10-05",
+          statement_closing_date: "2026-09-20",
+        },
+      };
+      await persistStagedSyncWrite(db, { records: [otherAccount, first] });
+      await persistStagedSyncWrite(db, {
+        records: [
+          {
+            ...first,
+            payload: {
+              ...first.payload,
+              statement_amount: null,
+              minimum_payment: null,
+              paid_amount: null,
+              is_paid: 0,
+              payment_due_date: null,
+              statement_closing_date: null,
+              updated_at: "2026-09-02T00:00:00Z",
+            },
+          },
+        ],
+      });
+      expect(
+        await db
+          .prepare(
+            "SELECT statement_amount, minimum_payment, paid_amount, is_paid, payment_due_date, statement_closing_date FROM credit_card_bills",
+          )
+          .first(),
+      ).toEqual({
+        statement_amount: null,
+        minimum_payment: null,
+        paid_amount: 600,
+        is_paid: 1,
+        payment_due_date: null,
+        statement_closing_date: null,
+      });
+    },
+  );
 
   it("暫存後變更憑證時，舊同步不能寫入金融資料或覆蓋新憑證與 cursor", async () => {
     const records = [account, transaction("posted")];

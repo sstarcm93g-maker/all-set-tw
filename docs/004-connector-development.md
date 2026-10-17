@@ -341,7 +341,7 @@ Migration `0043_merge_legacy_invoice_duplicates.sql` 以相同發票號碼整併
 
 OTP 通過後，國泰可能先顯示「密碼已超過半年未更新」提醒頁並停在 `/MyBank/Quicklinks/Home`，擋住信任裝置設定。同步會點選「暫不變更」略過提醒，不變更使用者的密碼；該頁也視為 OTP 驗證成功。信任裝置是否完成，除頁面上的成功訊息外，也以 `CUB.eBank.DeviceId` cookie 輔助確認；該 cookie 可能是 HttpOnly，須由瀏覽器端（CDP）讀取，`document.cookie` 看不到。兩者都偵測不到時記錄不含個資的 `cathaybk_trusted_device_not_detected` 並回報未完成。
 
-國泰當期與歷史帳單於單次同步內按帳戶、期別及幣別合併，當期資料優先；不同幣別使用不同帳戶 ID。跨次同步仍以既有 `(connector_id, account_id, billing_period)` 原位更新，不另建歷史副本。`HistoryBillList` 僅在提供有限數值的 `twdAmount` 時更新應繳總額（包含 0 及負值）；缺漏或無效金額不清空已保存總額。國泰帳單在 persistence 中以非 NULL 新值更新應繳總額、最低應繳、已繳金額、繳款期限、結帳日與銀行已繳／未繳狀態，缺欄保留既有值，0 與 false 均為有效更新；source、raw 與更新時間仍反映最新來源。不依賴 raw 判斷合併，亦不改其他銀行的 NULL 更新或已繳狀態規則。這不變更使用者繳款 override，也不加入查詢失敗時的 fail-soft。
+國泰當期與歷史帳單於單次同步內按帳戶、期別及幣別合併，當期資料優先；不同幣別使用不同帳戶 ID。跨次同步仍以既有 `(connector_id, account_id, billing_period)` 原位更新，不另建歷史副本。`HistoryBillList` 僅在提供有限數值的 `twdAmount` 時更新應繳總額（包含 0 及負值）；缺漏或無效金額不清空已保存總額。國泰帳單在 persistence 中以非 NULL 新值更新應繳總額、最低應繳、已繳金額、繳款期限、結帳日與銀行已繳／未繳狀態，缺欄保留既有值，0 與 false 均為有效更新；source、raw 與更新時間仍反映最新來源。不依賴 raw 判斷合併；此安全合併亦適用永豐，其餘銀行的 NULL 更新或已繳狀態規則維持不變。這不變更使用者繳款 override，也不加入查詢失敗時的 fail-soft。
 
 ### 永豐銀行
 
@@ -370,6 +370,7 @@ OTP 通過後，國泰可能先顯示「密碼已超過半年未更新」提醒�
 負值為欠款，正值為溢繳餘額；餘額非負時標記無需繳款。已繳款為 0 且應繳總額為正時，帳單狀態為待繳。缺少已繳款欄位或無法解析時不建立該筆帳務快照，
 台幣總覽的負應繳金額仍保留為正餘額，不取絕對值或歸零。
 結帳日與繳款期限分別取自 `BaseData.STMTDATE`、`BaseData.DUEDATE`；保留既有台幣歷史帳單查詢。
+跨次同步以既有 `(connector_id, account_id, billing_period)` 原位更新，不另建同一期歷史副本。永豐與國泰帳單共用 persistence 安全合併：應繳總額、最低應繳、已繳金額、繳款期限、結帳日與銀行付款狀態缺欄或為 NULL 時保留既有值；有效 0 與明確 false 仍可更新，包含銀行明確回覆未繳時由已繳改為未繳。source、raw 與更新時間仍反映最新來源；不改 parser、fallback、使用者繳款 override 或其餘銀行規則。
 外幣未列於本期 `BillAmounts` 時，使用銀行本次 `OutstandingDetail.SubTotal` 小計作為未出帳負債快照，
 不建立帳單、不填入繳款期限；不得累加本機歷史交易替代本次小計。資產頁對未知信用卡餘額顯示
 「剩餘應繳金額未取得」，相關負債合計顯示「資料不完整」。繳款狀態以銀行已入帳資料為準，

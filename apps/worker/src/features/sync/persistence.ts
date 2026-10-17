@@ -562,7 +562,7 @@ function promotionStatement(
             AND date(invoices.invoice_date, '+8 hours') = excluded.invoice_date
           THEN invoices.invoice_date ELSE excluded.invoice_date END`;
       if (entityType === "credit_card_bill") {
-        // Cathay history omits current-bill details; do not erase saved values.
+        // Cathay/Sinopac history may omit bill details; do not erase saved values.
         // Keep every other connector's existing NULL/update semantics unchanged.
         if (
           [
@@ -572,14 +572,14 @@ function promotionStatement(
             "statement_closing_date",
           ].includes(column)
         )
-          return `${column} = CASE WHEN excluded.connector_id = 'cathaybk'
+          return `${column} = CASE WHEN excluded.connector_id IN ('cathaybk', 'sinopac')
             THEN COALESCE(excluded.${column}, credit_card_bills.${column})
             ELSE excluded.${column} END`;
         if (column === "paid_amount")
           return "paid_amount = COALESCE(excluded.paid_amount, credit_card_bills.paid_amount)";
         if (column === "is_paid")
           return `is_paid = CASE
-            WHEN excluded.connector_id = 'cathaybk'
+            WHEN excluded.connector_id IN ('cathaybk', 'sinopac')
               THEN COALESCE(excluded.is_paid, credit_card_bills.is_paid)
             WHEN credit_card_bills.is_paid = 1 OR excluded.is_paid = 1 THEN 1
             ELSE COALESCE(excluded.is_paid, credit_card_bills.is_paid)
